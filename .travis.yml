@@ -1,6 +1,10 @@
 language: bash
 services: docker
 
+os:
+  - linux
+  - linux-ppc64le
+
 env:
   - VERSION=5.5
   - VERSION=10.3
