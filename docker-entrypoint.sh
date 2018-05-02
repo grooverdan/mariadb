@@ -95,7 +95,7 @@ if [ "$1" = 'mysqld' -a -z "$wantHelp" ]; then
 		"$@" --skip-networking --socket="${SOCKET}" &
 		pid="$!"
 
-		mysql=( mysql --protocol=socket -uroot -hlocalhost --socket="${SOCKET}" )
+		mysql=( mysql --protocol=socket -uroot -hlocalhost --socket="${SOCKET}"  --batch --skip-column-names )
 
 		for i in {30..0}; do
 			if echo 'SELECT 1' | "${mysql[@]}" &> /dev/null; then
@@ -131,18 +131,21 @@ if [ "$1" = 'mysqld' -a -z "$wantHelp" ]; then
 			EOSQL
 		fi
 
-		"${mysql[@]}" <<-EOSQL
-			-- What's done in this file shouldn't be replicated
-			--  or products like mysql-fabric won't work
-			SET @@SESSION.SQL_LOG_BIN=0;
+		{
+			# -- What's done in this file shouldn't be replicated
+			# --  or products like mysql-fabric won't work. Galera doesn't like it either
+			echo "SET @@SESSION.SQL_LOG_BIN=0;"
+			echo "SELECT GROUP_CONCAT(CONCAT('DROP USER ',user,'@',host) SEPARATOR ';') FROM mysql.user WHERE user NOT IN ('mysql.sys', 'mysqlxsys', 'root') OR host NOT IN ('localhost')" \
+				| "${mysql[@]}"
 
-			DELETE FROM mysql.user WHERE user NOT IN ('mysql.sys', 'mysqlxsys', 'root') OR host NOT IN ('localhost') ;
-			SET PASSWORD FOR 'root'@'localhost'=PASSWORD('${MYSQL_ROOT_PASSWORD}') ;
-			GRANT ALL ON *.* TO 'root'@'localhost' WITH GRANT OPTION ;
+			cat <<-EOSQL
 			${rootCreate}
 			DROP DATABASE IF EXISTS test ;
-			FLUSH PRIVILEGES ;
-		EOSQL
+			SET PASSWORD FOR 'root'@'localhost'=PASSWORD('${MYSQL_ROOT_PASSWORD}') ;
+			GRANT ALL ON *.* TO 'root'@'localhost' WITH GRANT OPTION ;
+			EOSQL
+		} | \
+			"${mysql[@]}"
 
 		if [ ! -z "$MYSQL_ROOT_PASSWORD" ]; then
 			mysql+=( -p"${MYSQL_ROOT_PASSWORD}" )
