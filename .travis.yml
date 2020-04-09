@@ -1,6 +1,11 @@
 language: bash
 services: docker
 
+arch:
+  - ppc64le
+  - amd64
+  - arm64
+
 env:
   - VERSION=10.5
   - VERSION=10.4
