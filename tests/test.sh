@@ -4,7 +4,7 @@ set -xeuvo pipefail
 
 die()
 {
-	echo $@ >2
+	echo $@ >&2
 	exit 1
 }
 
@@ -160,13 +160,133 @@ podman kill m_init
 podman unshare chown root: -R "$initdb"
 rm -rf "${initdb}"
 
-
-exit 0
-
 # Prefer MariaDB names
 runandwait m_rootpass -d  -e MARIADB_ROOT_PASSWORD=examplepass -e MYSQL_ROOT_PASSWORD=mysqlexamplepass  mariadb
 podman exec -t m_rootpass  mysql -u root -pexamplepass -e 'select current_user()'
 podman exec -t m_rootpass  mysql -u root -pwrongpass -e 'select current_user()' || echo 'expected failure' 
 podman kill m_rootpass
 
-#TODO - copy above tests with s/MYSQL_/MARIADB_/g
+# Defaults to clean environment
+runandwait m_envtest -d  -e MARIADB_ALLOW_EMPTY_PASSWORD=1  mariadb
+podman exec -t m_envtest  mysql -u root -e 'show databases'
+
+othertables=$(podman exec -t m_envtest  mysql -u root --skip-column-names -Be "select group_concat(SCHEMA_NAME) from information_schema.SCHEMATA where SCHEMA_NAME not in ('mysql', 'information_schema', 'performance_schema')")
+
+[ "${othertables}" != $'NULL\r' ] && die "unexpected table(s) $othertables"
+otherusers=$(podman exec -t m_envtest  mysql -u root --skip-column-names -Be "select user,host from mysql.user where (user,host) not in (('root', 'localhost'), ('root', '%'), ('mariadb.sys', 'localhost'))")
+
+[ "$otherusers" != '' ] && die "unexpected users $otherusers"
+podman kill m_envtest
+
+# MARIADB_ROOT_PASSWORD
+
+runandwait m_rootpass -d  -e MARIADB_ROOT_PASSWORD=examplepass  mariadb
+podman exec -t m_rootpass  mysql -u root -pexamplepass -e 'select current_user()'
+podman exec -t m_rootpass  mysql -u root -pwrongpass -e 'select current_user()' || echo 'expected failure' 
+podman kill m_rootpass
+
+# MARIADB_ALLOW_EMPTY_PASSWORD
+
+runandwait m_emptyrootpass -d  -e MARIADB_ALLOW_EMPTY_PASSWORD=1  mariadb
+podman exec -t m_emptyrootpass  mysql -u root -e 'select current_user()'
+podman kill m_emptyrootpass
+podman exec -t m_emptyrootpass  mysql -u root -pexamplepass -e 'select current_user()' || echo 'expected failure'
+
+# MARIADB_ALLOW_EMPTY_PASSWORD Implementation is non-empty value so this should fail
+podman run  --rm  --name m_emptyrootpass -d  -e MARIADB_ALLOW_EMPTY_PASSWORD  mariadb || echo 'expected failure'
+
+
+# MARIADB_ROOT_PASSWORD
+runandwait m_rndrootpass -d  -e MARIADB_RANDOM_ROOT_PASSWORD=1  mariadb
+pass=$(podman logs m_rndrootpass | grep 'GENERATED ROOT PASSWORD' 2>&1)
+# trim up until passwod
+pass=${pass##* } 
+podman exec -t m_rndrootpass  mysql -u root -p"${pass}" -e 'select current_user()'
+podman kill m_rndrootpass
+
+runandwait m_rndrootpass -d  -e MARIADB_RANDOM_ROOT_PASSWORD=1  mariadb
+newpass=$(podman logs m_rndrootpass | grep 'GENERATED ROOT PASSWORD' 2>&1)
+# trim up until passwod
+newpass=${newpass##* } 
+podman kill m_rndrootpass
+
+[ "$pass" = "$newpass" ] && die "highly improbable - two consequitive passwords are the same" 
+
+# MARIADB_ROOT_HOST
+runandwait m_roothost -d -e  MARIADB_ALLOW_EMPTY_PASSWORD=1  -e MARIADB_ROOT_HOST=apple  mariadb
+ru=$(podman exec -t m_roothost  mysql  --skip-column-names -B -u root -e 'select user,host from mysql.user where host="apple"')
+[ "${ru}" = '' ] && die 'root@apple not created'
+podman kill m_roothost
+
+
+# MARIADB_INITDB_SKIP_TZINFO=''
+
+runandwait m_with_tzinit -d -e MARIADB_INITDB_SKIP_TZINFO= -e MARIADB_ALLOW_EMPTY_PASSWORD=1  mariadb
+tzcount=$(podman exec -t m_with_tzinit  mysql  --skip-column-names -B -u root -e "SELECT COUNT(*) FROM mysql.time_zone")
+[ "${tzcount}" = $'0\r' ] && die "should exist timezones"
+podman kill m_with_tzinit
+
+# MARIADB_INITDB_SKIP_TZINFO=1
+
+runandwait m_without_tzinit -d -e MARIADB_INITDB_SKIP_TZINFO=1 -e MARIADB_ALLOW_EMPTY_PASSWORD=1  mariadb
+tzcount=$(podman exec -t m_without_tzinit  mysql --skip-column-names -B -u root -e "SELECT COUNT(*) FROM mysql.time_zone")
+[ "${tzcount}" = $'0\r' ] || die "timezones shouldn't be loaded - found ${tzcount}"
+podman kill m_without_tzinit
+
+# Secrets _FILE vars
+secretdir=$(mktemp -d)
+ddir=$(mktemp -d)
+echo bob > "$secretdir"/pass
+echo pluto > "$secretdir"/host
+echo titan > "$secretdir"/db
+echo ron > "$secretdir"/u
+echo scappers > $secretdir/p
+podman unshare chown root: -R "$secretdir"
+podman unshare chown 999:999 -R "$ddir"
+# bug because of rootless - root+mysql need to read it - fixable in entrypoint
+#!podman unshare chmod go+rwX -R "$ddir"
+
+#!       	-v "$ddir":/var/lib/mysql \
+runandwait m_secrets -d \
+       	-v "$secretdir":/run/secrets:Z \
+	-e MARIADB_ROOT_PASSWORD_FILE=/run/secrets/pass \
+	-e MARIADB_ROOT_HOST_FILE=/run/secrets/host \
+	-e MARIADB_DATABASE_FILE=/run/secrets/db \
+	-e MARIADB_USER_FILE=/run/secrets/u \
+	-e MARIADB_PASSWORD_FILE=/run/secrets/p \
+	mariadb
+host=$(podman exec -t m_secrets mysql  --skip-column-names -B -u root -pbob -e 'select host from mysql.user where user="root" and host="pluto"' titan)
+[ "${host}" != $'pluto\r' ] && die 'root@pluto not created'
+creation=$(podman exec -t m_secrets mysql --skip-column-names -B -u ron -pscappers -P 3306 --protocol tcp titan -e "CREATE TABLE landing (i INT)")
+[ "${creation}" = '' ] || die 'creation error'
+
+podman kill m_secrets
+podman unshare chown root: -R "$ddir"
+rm -rf "${secretdir}"
+
+#!# restart on prev volumne
+#!runandwait m_reuse -d \
+#!       	-v "$ddir":/var/lib/mysql \
+#!	mariadb
+#!persistent=$(podman exec -t m_reuse mysql --skip-column-names -B -u ron -pscappers -P 3306 --protocol tcp titan -e "insert into landing values (32),(42),(48)")
+#![ "${persistent}" = '' ] || die 'reuse error error'
+#!podman kill m_reuse
+rm -rf "${ddir}"
+
+initdb=$(mktemp -d)
+cp -a initdb.d/* "${initdb}"
+gzip "${initdb}"/*gz*
+xz "${initdb}"/*xz*
+podman unshare chown 999:999 -R "$initdb"
+runandwait m_init -d \
+        -v "${initdb}":/docker-entrypoint-initdb.d:Z \
+	-e MARIADB_ROOT_PASSWORD=ssh \
+	-e MARIADB_DATABASE=titan \
+	-e MARIADB_USER=ron \
+	-e MARIADB_PASSWORD=scappers \
+	mariadb
+init_sum=$(podman exec -t m_init mysql --skip-column-names -B -u ron -pscappers -P 3306 -h 127.0.0.1  --protocol tcp titan -e "select sum(i) from t1;")
+[ "${init_sum}" = $'1860\r' ] || (podman logs m_init; die 'initialization order error')
+podman kill m_init
+podman unshare chown root: -R "$initdb"
+rm -rf "${initdb}"
