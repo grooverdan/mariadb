@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
+set -x -v
 defaultSuite='focal'
 declare -A suites=(
 	[10.2]='bionic'
@@ -29,36 +30,27 @@ getRemoteVersion() {
 
 cd "$(dirname "$(readlink -f "$BASH_SOURCE")")"
 
-versions=( "$@" )
-if [ ${#versions[@]} -eq 0 ]; then
-	versions=( */ )
-fi
-versions=( "${versions[@]%/}" )
-
-for version in "${versions[@]}"; do
-	suite="${suites[$version]:-$defaultSuite}"
-	fullVersion="$(getRemoteVersion "$version" "$suite" 'amd64')"
-	if [ -z "$fullVersion" ]; then
-		echo >&2 "warning: cannot find $version in $suite"
+curl -fsSL https://downloads.mariadb.org/rest-api/mariadb/ \
+	| jq '.major_releases[] | [ .release_id ], [ .release_status ]  | @tsv ' \
+	| while read version
+do
+	version=${version//\"}
+	if [ ! -d $version ]; then
+		echo >&2 "warning: no rule for $version"
 		continue
 	fi
+	suite="${suites[$version]:-$defaultSuite}"
+	fullVersion="$(getRemoteVersion "$version" "$suite" 'amd64')"
 
-	mariaVersion="${fullVersion##*:}"
-	mariaVersion="${mariaVersion%%[-+~]*}"
+	read releaseStatus
+	releaseStatus=${releaseStatus//\"}
 
-	# "Alpha", "Beta", "Gamma", "RC", "Stable", etc.
-	releaseStatus="$(
-		wget -qO- 'https://downloads.mariadb.org/mariadb/+releases/' \
-			| xargs -d '\n' \
-			| grep -oP '<tr>.+?</tr>' \
-			| grep -P '>\Q'"$mariaVersion"'\E<' \
-			| grep -oP '<td>[^0-9][^<]*</td>' \
-			| sed -r 's!^.*<td>([^0-9][^<]*)</td>.*$!\1!'
-	)"
-	case "$releaseStatus" in
-		Alpha | Beta | Gamma | RC | Stable ) ;; # sanity check
+	case "$releaseStatus" in Alpha | Beta | Gamma | RC | "Old Stable" | Stable ) ;; # sanity check
 		*) echo >&2 "error: unexpected 'release status' value for $mariaVersion: $releaseStatus"; exit 1 ;;
 	esac
+
+	mariaVersion=$( curl -fsSL https://downloads.mariadb.org/rest-api/mariadb/${version} | jq 'first(..|select(.release_id)) | .release_id' )
+	mariaVersion=${mariaVersion//\"}
 
 	echo "$version: $mariaVersion ($releaseStatus)"
 
@@ -92,4 +84,5 @@ for version in "${versions[@]}"; do
 		10.2 | 10.3 | 10.4) ;;
 		*) sed -i '/backwards compat/d' "$version/Dockerfile" ;;
 	esac
+
 done
